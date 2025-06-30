@@ -20,18 +20,12 @@ public class PaymentStatusScheduler {
         TraceUtil.ensureTraceContext();
         try {
             log.info("Checking pending payments...");
-        } finally {
-            TraceUtil.clear();
-        }
-
-        cashfreeService.updatePendingPayments();
-
-        TraceUtil.ensureTraceContext();
-        try {
+            cashfreeService.updatePendingPayments();
             log.info("Finished Checking pending payments...");
         } finally {
             TraceUtil.clear();
         }
+
 
     }
 }

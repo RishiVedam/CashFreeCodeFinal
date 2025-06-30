@@ -7,6 +7,7 @@ import com.example.payment.entity.OrderEntity;
 import com.example.payment.entity.OrderPaymentEntity;
 import com.example.payment.repository.OrderPaymentRepository;
 import com.example.payment.repository.OrderRepository;
+import com.example.payment.utils.TraceUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -165,79 +166,84 @@ public class CashfreeService {
 
     public void updatePaymentStatus(String orderId) {
 
-
-        log.info("Updating PaymentStatus for orderId:{}", orderId);
-        OrderEntity order = orderRepository.findByOrderId(orderId);
-        if (order == null) {
-
-            log.warn("Order not found locally for orderId:{}", orderId);
-            return;
-        }
-
-        if (order.getSessionId() == null) {
-            log.warn("Skipping orderId:{}", orderId);
-            return;
-        }
-
-        List<Map<String, Object>> payments;
+        TraceUtil.ensureTraceContext();
         try {
-            CashfreeConfig.Credentials creds =
-                    accountService.getCredentialsForFee(order.getFeeType());
+            log.info("Updating PaymentStatus for orderId:{}", orderId);
+            OrderEntity order = orderRepository.findByOrderId(orderId);
+            if (order == null) {
 
-            payments = cashfreeClient.getPaymentsByOrderId(
-                    orderId,
-                    creds.getClientId(),
-                    creds.getClientSecret(),
-                    "2025-01-01");
+                log.warn("Order not found locally for orderId:{}", orderId);
+                return;
+            }
 
-        } catch (feign.FeignException.NotFound nf) {
+            if (order.getSessionId() == null) {
+                log.warn("Skipping orderId:{}", orderId);
+                return;
+            }
+
+            List<Map<String, Object>> payments;
+            try {
+                CashfreeConfig.Credentials creds =
+                        accountService.getCredentialsForFee(order.getFeeType());
+
+                payments = cashfreeClient.getPaymentsByOrderId(
+                        orderId,
+                        creds.getClientId(),
+                        creds.getClientSecret(),
+                        "2025-01-01");
+
+            } catch (feign.FeignException.NotFound nf) {
 //            log.atWarn().addKeyValue("orderId",orderId).log("orderId not found on Cashfree");
-            log.warn("orderId not found on Cashfree:{}", orderId);
-            order.setStatus("PENDING");
-            orderRepository.save(order);
-            return;
-        } catch (feign.FeignException fe) {
+                log.warn("orderId not found on Cashfree:{}", orderId);
+                order.setStatus("PENDING");
+                orderRepository.save(order);
+                return;
+            } catch (feign.FeignException fe) {
 //            log.atWarn().addKeyValue("orderId",orderId).log("Cashfree error for orderId");
-            log.warn("Cashfree error for orderId:{}", orderId);
-            return;   // keep order as-is; try again next cycle
-        }
+                log.warn("Cashfree error for orderId:{}", orderId);
+                return;   // keep order as-is; try again next cycle
+            }
 
-        if (payments == null || payments.isEmpty()) {
+            if (payments == null || payments.isEmpty()) {
 //            log.atInfo().addKeyValue("orderId",orderId).log("No payments found for orderId");
-            log.warn("No payments found for orderId:{}", orderId);
-            return;
+                log.warn("No payments found for orderId:{}", orderId);
+                return;
+            }
+
+            payments.stream()
+                    .map(p -> mapToPaymentEntity(order, p))
+                    .filter(Objects::nonNull)
+                    .filter(pe -> !orderPaymentRepository
+                            .existsByPaymentIdAndPaymentStatus(
+                                    pe.getPaymentId(), pe.getPaymentStatus()))
+                    .forEach(orderPaymentRepository::save);
+
+            boolean anySuccess = payments.stream()
+                    .anyMatch(p -> "SUCCESS".equalsIgnoreCase(
+                            getAsString(p.get("payment_status"))));
+
+            if (anySuccess) {
+                order.setStatus("SUCCESS");
+            } else {
+                // latest status logic (unchanged)
+                payments.sort((a, b) -> {
+                    try {
+                        return Instant.parse(getAsString(b.get("payment_completion_time")))
+                                .compareTo(
+                                        Instant.parse(getAsString(a.get("payment_completion_time"))));
+                    } catch (Exception ex) {
+                        return 0;
+                    }
+                });
+                order.setStatus(getAsString(payments.get(0).get("payment_status")));
+            }
+            orderRepository.save(order);
+
+            log.info("Order status updated to :{} for orderId:{}", order.getStatus(), orderId);
+        } finally {
+            TraceUtil.clear();
         }
 
-        payments.stream()
-                .map(p -> mapToPaymentEntity(order, p))
-                .filter(Objects::nonNull)
-                .filter(pe -> !orderPaymentRepository
-                        .existsByPaymentIdAndPaymentStatus(
-                                pe.getPaymentId(), pe.getPaymentStatus()))
-                .forEach(orderPaymentRepository::save);
-
-        boolean anySuccess = payments.stream()
-                .anyMatch(p -> "SUCCESS".equalsIgnoreCase(
-                        getAsString(p.get("payment_status"))));
-
-        if (anySuccess) {
-            order.setStatus("SUCCESS");
-        } else {
-            // latest status logic (unchanged)
-            payments.sort((a, b) -> {
-                try {
-                    return Instant.parse(getAsString(b.get("payment_completion_time")))
-                            .compareTo(
-                                    Instant.parse(getAsString(a.get("payment_completion_time"))));
-                } catch (Exception ex) {
-                    return 0;
-                }
-            });
-            order.setStatus(getAsString(payments.get(0).get("payment_status")));
-        }
-        orderRepository.save(order);
-
-        log.info("Order status updated to :{} for orderId:{}", order.getStatus(), orderId);
     }
 
     private OrderPaymentEntity mapToPaymentEntity(OrderEntity order, Map<String, Object> payment) {
